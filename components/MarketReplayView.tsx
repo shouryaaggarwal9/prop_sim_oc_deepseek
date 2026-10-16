@@ -35,7 +35,7 @@ import {
   type PropAccount,
 } from '@/lib/types';
 import { calculateIndianCharges } from '@/lib/engine/indianTaxes';
-import { bookRealizedPnl } from '@/lib/engine/propRisk';
+import { closePositions } from '@/lib/engine/tradeLedger';
 import { cn, formatINR } from '@/lib/utils';
 
 interface MarketReplayViewProps {
@@ -171,7 +171,9 @@ export function MarketReplayView({ propAccount, onUpdateAccount }: MarketReplayV
     (id: string) => {
       const target = positions.find((p) => p.id === id);
       if (!target) return;
-      onUpdateAccount((account) => bookRealizedPnl(account, target.unrealizedPnL));
+      // Book and record through the shared close path so replayed trades reach
+      // the same ledger as trades taken in the prop terminal.
+      onUpdateAccount((account) => closePositions(account, [target], 'REPLAY_EXIT').account);
       setLegs((prev) => prev.filter((p) => p.id !== id));
     },
     [positions, onUpdateAccount]

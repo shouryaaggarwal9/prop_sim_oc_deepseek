@@ -22,6 +22,7 @@ import type { Position, PropAccount } from '@/lib/types';
 import { cn, formatINR } from '@/lib/utils';
 import { targetForPhase, violatesConsistencyRule } from '@/lib/engine/propRisk';
 import { Modal } from '@/components/ui/Modal';
+import { TradeLedger } from '@/components/TradeLedger';
 
 interface PropFirmDashboardProps {
   account: PropAccount;
@@ -370,6 +371,8 @@ export function PropFirmDashboard({
           </div>
         )}
       </div>
+
+      <TradeLedger trades={account.closedTrades} dailyPnLHistory={account.dailyPnLHistory} />
 
       <Modal
         isOpen={isPayoutOpen}

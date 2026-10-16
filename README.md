@@ -18,7 +18,7 @@ Everything runs in the browser. State persists to `localStorage`, so a refresh m
 | lucide-react | 1.57.0 | |
 | TypeScript | 6.0.3 | See the note below |
 | ESLint | 9.39.5 | Flat config, `eslint-config-next@16` |
-| Vitest | 5.0.4 | 127 unit tests over the engine layer |
+| Vitest | 5.0.4 | 145 unit tests over the engine layer |
 
 > **Why TypeScript 6.0.3 and not 7.x?**
 > TypeScript 7.0.2 is the current `latest` tag, but `typescript-eslint@8` — which
@@ -54,6 +54,12 @@ project's own lint config, never by untrusted input.
   clean balance, day counter and history.
 * **Payout desk** — simulated profit-split withdrawals, validated against available
   profit and the trailing floor.
+* **Trade ledger** — every closed leg is journaled with its entry, exit, realised P&L,
+  statutory cost and the reason it closed (manual, square-off, risk liquidation, payout
+  flatten, replay exit). The dashboard derives win rate, profit factor and a daily
+  realised-P&L chart from it. All five close paths funnel through a single
+  `closePositions` call, so the ledger's realised P&L always reconciles with the
+  balance movement.
 
 ### 2. 📊 Options strategy builder
 * **Black-Scholes-Merton** with continuous dividend yield.
@@ -127,11 +133,12 @@ lib/
     pricing.ts           volatility smile, option chain, tick rounding
     strategySimulator.ts payoff, breakevens, PoP, margin, extremes
     propRisk.ts          drawdown governance, phase progression, payouts
+    tradeLedger.ts       closed-trade journal, ledger summary, shared close path
     backtester.ts        event-driven session backtester
     indianTaxes.ts       statutory cost model
   data/                  deterministic synthetic tapes
   hooks/                 usePersistentState (useSyncExternalStore)
-tests/                   127 unit tests over lib/
+tests/                   145 unit tests over lib/
 ```
 
 The `lib/engine` layer is deliberately free of React and of DOM APIs, which is why

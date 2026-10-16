@@ -101,6 +101,7 @@ export function createPropAccount(
     tradingDays: 0,
     dailyPnLHistory: [],
     payouts: [],
+    closedTrades: [],
     createdAt: new Date().toISOString(),
     currentTradingDate: todayIso(),
   };
@@ -282,6 +283,9 @@ export function evaluatePropRisk(
  * Move to the next phase. A fresh phase restarts with a clean balance, a clean
  * day counter and a clean consistency history, mirroring how real two-phase
  * evaluations are structured.
+ *
+ * `closedTrades` is deliberately preserved: it is the trader's journal rather
+ * than a per-phase counter, so a whole challenge's history survives promotion.
  */
 function advancePhase(account: PropAccount, next: ChallengePhase): PropAccount {
   return {
@@ -306,11 +310,18 @@ function advancePhase(account: PropAccount, next: ChallengePhase): PropAccount {
  * consistency history, reset the daily anchor and advance the day counter.
  *
  * Only days that were actually traded are counted toward `minTradingDays`.
+ *
+ * @param dayRealizedPnL P&L that has NOT yet reached the balance.
+ * @param recordedDayPnL The figure written to the day history. Defaults to
+ *   `dayRealizedPnL`. Callers that book each close as it happens (the prop
+ *   terminal does) pass 0 for `dayRealizedPnL` and supply the day's true figure
+ *   here, so the history is accurate without the balance being credited twice.
  */
 export function rollOverTradingDay(
   account: PropAccount,
   dayRealizedPnL: number,
-  tradingDate?: string
+  tradingDate?: string,
+  recordedDayPnL: number = dayRealizedPnL
 ): PropAccount {
   if (account.status !== 'ACTIVE') return account;
 
@@ -321,8 +332,8 @@ export function rollOverTradingDay(
   // end-of-day ticks cannot double-count a day.
   const alreadyRolled = account.dailyPnLHistory.some((d) => d.date === date);
   const history = alreadyRolled
-    ? account.dailyPnLHistory.map((d) => (d.date === date ? { ...d, pnl: dayRealizedPnL } : d))
-    : [...account.dailyPnLHistory, { date, pnl: dayRealizedPnL }];
+    ? account.dailyPnLHistory.map((d) => (d.date === date ? { ...d, pnl: recordedDayPnL } : d))
+    : [...account.dailyPnLHistory, { date, pnl: recordedDayPnL }];
 
   return {
     ...account,

@@ -14,7 +14,6 @@ import type { Position, PropAccount, UnderlyingSymbol } from '@/lib/types';
 import { getInstrument } from '@/lib/types';
 import { premiumForStrike } from '@/lib/engine/pricing';
 import {
-  bookRealizedPnl,
   createPropAccount,
   evaluatePropRisk,
   requestPayout,
@@ -22,6 +21,7 @@ import {
   syncTradingDate,
   withdrawableProfit,
 } from '@/lib/engine/propRisk';
+import { closePositions, realisedPnlForDate } from '@/lib/engine/tradeLedger';
 
 interface AppState {
   account: PropAccount;
@@ -36,6 +36,23 @@ const initialState: AppState = {
   account: createPropAccount('Quant Trader', 'pro-10l', false),
   positions: [],
 };
+
+/**
+ * Backfill fields added after the persisted payload was first written.
+ *
+ * Must stay module-level: `usePersistentState` caches snapshots by storage key,
+ * so an inline arrow here would change identity on every render.
+ */
+function migrateAppState(raw: unknown): AppState {
+  const stored = (raw ?? {}) as Partial<AppState>;
+  const account = stored.account;
+  if (!account) return initialState;
+
+  return {
+    account: { ...account, closedTrades: account.closedTrades ?? [] },
+    positions: stored.positions ?? [],
+  };
+}
 
 /**
  * Mark an open leg against the synthetic spot clock.
@@ -74,24 +91,35 @@ function applyRiskGuard(next: AppState, marks: Map<string, number>): AppState {
   // and must stay under live breach monitoring.
   if (next.account.status === 'FAILED') return next;
 
-  const unrealized = next.positions.reduce(
-    (acc, p) => acc + (marks.get(p.id) ?? p.unrealizedPnL),
-    0
-  );
+  // Mark the book first, so the risk engine, the liquidation and the ledger are
+  // all reading the same numbers.
+  const marked = next.positions.map((p) => ({
+    ...p,
+    unrealizedPnL: marks.get(p.id) ?? p.unrealizedPnL,
+  }));
+  const unrealized = marked.reduce((acc, p) => acc + p.unrealizedPnL, 0);
+
   const result = evaluatePropRisk(next.account, unrealized);
   if (result.updatedAccount === next.account) return next;
 
-  return {
-    account: result.updatedAccount,
-    // A hard breach squares off every open position.
-    positions: result.hasBreached ? [] : next.positions,
-  };
+  // A hard breach liquidates the book. A liquidation realises P&L, so it is
+  // booked and recorded exactly like any other close.
+  if (result.hasBreached) {
+    const { account } = closePositions(result.updatedAccount, marked, 'RISK_BREACH');
+    return { account, positions: [] };
+  }
+
+  return { account: result.updatedAccount, positions: next.positions };
 }
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<AppTab>('PROP');
   const [isAccountModalOpen, setIsAccountModalOpen] = useState(false);
-  const [state, setState] = usePersistentState<AppState>('quantprop:state:v1', initialState);
+  const [state, setState] = usePersistentState<AppState>(
+    'quantprop:state:v1',
+    initialState,
+    migrateAppState
+  );
   const [notice, setNotice] = useState<string | null>(null);
   const [markingUnderlying, setMarkingUnderlying] = useState<UnderlyingSymbol>('NIFTY');
 
@@ -137,28 +165,28 @@ export default function Home() {
 
   const handleSquareOffPosition = useCallback(
     (positionId: string) => {
+      // Close from the marked book, not the stored one, so the ledger records
+      // the same exit price the trader was just looking at.
+      const target = positions.find((p) => p.id === positionId);
+      if (!target) return;
+
       commit((prev) => {
-        const target = prev.positions.find((p) => p.id === positionId);
-        if (!target) return prev;
-        const pnl = marks.get(positionId) ?? target.unrealizedPnL;
+        const { account: nextAccount } = closePositions(prev.account, [target], 'MANUAL');
         return {
-          account: bookRealizedPnl(prev.account, pnl),
+          account: nextAccount,
           positions: prev.positions.filter((p) => p.id !== positionId),
         };
       });
     },
-    [commit, marks]
+    [commit, positions]
   );
 
   const handleSquareOffAll = useCallback(() => {
     commit((prev) => {
-      const total = prev.positions.reduce(
-        (acc, p) => acc + (marks.get(p.id) ?? p.unrealizedPnL),
-        0
-      );
-      return { account: bookRealizedPnl(prev.account, total), positions: [] };
+      const { account: nextAccount } = closePositions(prev.account, positions, 'SQUARE_OFF_ALL');
+      return { account: nextAccount, positions: [] };
     });
-  }, [commit, marks]);
+  }, [commit, positions]);
 
   const handleResetAccount = useCallback(() => {
     setState((prev) => ({
@@ -174,13 +202,24 @@ export default function Home() {
 
   /** Close the trading day: book P&L, count the day, reset the daily anchor. */
   const handleEndTradingDay = useCallback(() => {
-    commit((prev) => ({ ...prev, account: rollOverTradingDay(prev.account, 0) }));
+    commit((prev) => {
+      // Every close already booked its own P&L into the balance, so the day's
+      // figure is read from the ledger rather than passed as an unbooked delta.
+      const dayPnl = realisedPnlForDate(
+        prev.account.closedTrades,
+        prev.account.currentTradingDate
+      );
+      return { ...prev, account: rollOverTradingDay(prev.account, 0, undefined, dayPnl) };
+    });
     setNotice('Trading day closed. Daily loss limit reset and day counter advanced.');
   }, [commit]);
 
   const handleRequestPayout = useCallback(
     (amount: number) => {
-      const result = requestPayout(account, amount);
+      // Flatten the book through the ledger first, so the payout desk and the
+      // trader's journal agree on what was realised.
+      const { account: flattened } = closePositions(account, positions, 'PAYOUT_FLATTEN');
+      const result = requestPayout(flattened, amount);
       if (result.error) {
         setNotice(result.error);
         return;
@@ -188,7 +227,7 @@ export default function Home() {
       commit(() => ({ account: result.updatedAccount, positions: [] }));
       setNotice('Simulated payout credited to your wallet.');
     },
-    [account, commit]
+    [account, positions, commit]
   );
 
   const handleSelectPreset = useCallback(

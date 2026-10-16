@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useSyncExternalStore } from 'react';
+import { useCallback, useMemo, useSyncExternalStore } from 'react';
 
 /**
  * Cross-tab and same-tab notification bus.
@@ -30,10 +30,13 @@ function subscribe(onStoreChange: () => void): () => void {
  * freshly parsed object on every call would register as a change on every
  * render and loop forever. Keying the cache on the raw string keeps the
  * returned reference stable until the stored value actually differs.
+ *
+ * The cache is keyed on the storage key alone, so `migrate` must be a stable
+ * (module-level) function — never an inline arrow passed at the call site.
  */
 const snapshotCache = new Map<string, { raw: string | null; value: unknown }>();
 
-function readStored<T>(key: string, fallback: T): T {
+function readStored<T>(key: string, fallback: T, migrate?: (raw: unknown) => T): T {
   let raw: string | null = null;
   try {
     raw = window.localStorage.getItem(key);
@@ -55,6 +58,10 @@ function readStored<T>(key: string, fallback: T): T {
     }
   }
 
+  // Backfill fields added after this payload was first written, so a stored
+  // account from an older schema never reaches a component missing a field.
+  if (migrate) value = migrate(value);
+
   snapshotCache.set(key, { raw, value });
   return value as T;
 }
@@ -73,17 +80,28 @@ function resolveInitial<T>(initialValue: T | (() => T)): T {
  */
 export function usePersistentState<T>(
   key: string,
-  initialValue: T | (() => T)
+  initialValue: T | (() => T),
+  migrate?: (raw: unknown) => T
 ): [T, (value: T | ((prev: T) => T)) => void] {
   // The server must never see localStorage, so it always renders the fallback.
-  const getServerSnapshot = useCallback(() => resolveInitial(initialValue), [initialValue]);
-  const getSnapshot = useCallback(() => readStored(key, resolveInitial(initialValue)), [key, initialValue]);
+  // The snapshot is memoised because `getServerSnapshot` must return a cached
+  // value: running `migrate` on every call would hand React a fresh object each
+  // time and trip its "should be cached to avoid an infinite loop" guard.
+  const serverSnapshot = useMemo(() => {
+    const fresh = resolveInitial(initialValue);
+    return migrate ? migrate(fresh) : fresh;
+  }, [initialValue, migrate]);
+  const getServerSnapshot = useCallback(() => serverSnapshot, [serverSnapshot]);
+  const getSnapshot = useCallback(
+    () => readStored(key, resolveInitial(initialValue), migrate),
+    [key, initialValue, migrate]
+  );
 
   const value = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
 
   const set = useCallback(
     (next: T | ((prev: T) => T)) => {
-      const current = readStored(key, resolveInitial(initialValue));
+      const current = readStored(key, resolveInitial(initialValue), migrate);
       const resolved = typeof next === 'function' ? (next as (p: T) => T)(current) : next;
       try {
         window.localStorage.setItem(key, JSON.stringify(resolved));
@@ -92,7 +110,7 @@ export function usePersistentState<T>(
       }
       emitChange();
     },
-    [key, initialValue]
+    [key, initialValue, migrate]
   );
 
   return [value, set];

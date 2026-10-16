@@ -1,6 +1,6 @@
 # Roadmap — QuantProp India
 
-**Created:** 2026-10-16 · **Baseline:** Next.js 16.4.1 · React 19.3.1 · TS 6.0.3 · 130 tests · 0 prod vulnerabilities · 0 lint/tsc errors
+**Created:** 2026-10-16 · **Baseline:** Next.js 16.4.1 · React 19.3.1 · TS 6.0.3 · 145 tests · 0 prod vulnerabilities · 0 lint/tsc errors
 
 ## Decisions this roadmap is built on
 
@@ -24,7 +24,7 @@ Because of (3), two rules govern everything below:
 
 The rectification is real, tested, and entirely uncommitted. It is one `git reset` away from being lost.
 
-- [ ] Review the rectification diff, then commit it as a single well-described change
+- [x] Review the rectification diff, then commit it as a single well-described change
 - [ ] Tag `v1.1.0`
 - [ ] Add `.github/workflows/ci.yml` — `typecheck`, `lint`, `test`, `build`, `npm audit --omit=dev`
 - [ ] Add `.github/dependabot.yml` for npm (weekly patch/minor groups)
@@ -99,8 +99,11 @@ The weakest remaining part of the model, in order of severity:
 **⏱ Four to six sessions. Optional — pick by what you personally use.**
 
 - [ ] **Persist strategies.** Today there is exactly one `localStorage` key (`quantprop:state:v1` → account + positions). Rebuilding a strategy on refresh is pure friction.
-- [ ] Trade journal with cross-session analytics
-- [ ] Export (CSV / print-to-PDF report)
+- [x] **Trade ledger** — shipped. Every closed leg is journaled with its entry, exit,
+  realised P&L, statutory cost and exit reason; the Prop Terminal shows win rate,
+  profit factor and a daily realised-P&L chart
+- [ ] Cross-session analytics over the ledger — it currently resets when a new account is started
+- [ ] Export (CSV / print-to-PDF report) — the ledger is the natural data source
 - [ ] Strategy comparison — overlay two structures' payoff curves
 - [ ] Mobile pass (currently partial)
 
@@ -158,6 +161,21 @@ Steady-state after Phase 1, roughly monthly:
 
 ---
 
+## Progress since this roadmap was written
+
+- **Rectification committed and pushed** (`78a7898`, `65d7708`).
+- **Trade ledger shipped** (Phase 4). All five close paths now funnel through one
+  `closePositions` call; the Prop Terminal renders ledger stats and a daily
+  realised-P&L chart. Two defects fell out of the work:
+  - the day rollover recorded `0` for every day, which left the consistency rule
+    vacuous in the running app even after the engine was fixed — it now records the
+    day's actual realised P&L;
+  - a risk-breach liquidation discarded the book's unrealised loss instead of
+    realising it — it is now booked and journaled like any other close.
+
 ## Suggested immediate next action
 
-> **Phase 0, first bullet.** Review and commit the 43 changed files, then tag `v1.1.0` and add CI. Everything after this is incremental; this is not, because it is currently the only thing standing between this project and a lost afternoon's work.
+> **Phase 0 remainder.** Tag `v1.1.0` and add CI (`typecheck` + `lint` + `test` +
+> `build`, with `npm audit --omit=dev` as a separate non-blocking job). Then **Phase 1**
+> — the component tests are still the highest-value engineering spend, because the five
+> integration defects fixed in the rectification were all invisible to the engine tests.

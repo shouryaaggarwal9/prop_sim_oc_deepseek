@@ -188,6 +188,43 @@ export interface PayoutRecord {
   splitPct: number;
 }
 
+/** Why a leg was closed. Recorded on every ledger entry. */
+export type TradeExitReason =
+  | 'MANUAL'
+  | 'SQUARE_OFF_ALL'
+  | 'RISK_BREACH'
+  | 'PAYOUT_FLATTEN'
+  | 'REPLAY_EXIT';
+
+/**
+ * One closed leg, as booked into the balance.
+ *
+ * `realizedPnL` is copied verbatim from the marked position at the moment of
+ * closing, so the ledger and `bookRealizedPnl` can never disagree about what a
+ * trade was worth.
+ */
+export interface ClosedTrade {
+  id: string;
+  positionId: string;
+  symbol: string;
+  underlying: UnderlyingSymbol;
+  type: OptionType;
+  action: OrderAction;
+  strike: number;
+  expiry: string;
+  lots: number;
+  qty: number;
+  entryPrice: number;
+  exitPrice: number;
+  realizedPnL: number;
+  charges: IndianCharges;
+  openedAt: string;
+  closedAt: string;
+  exitReason: TradeExitReason;
+  /** Phase the account was in when this leg closed. */
+  phase: ChallengePhase;
+}
+
 export interface PropAccount {
   id: string;
   traderName: string;
@@ -205,6 +242,8 @@ export interface PropAccount {
   tradingDays: number;
   dailyPnLHistory: DailyPnlRecord[];
   payouts: PayoutRecord[];
+  /** Every closed leg, oldest first. Intentionally survives phase promotion. */
+  closedTrades: ClosedTrade[];
   breachReason?: string;
   passCertificateId?: string;
   /** ISO date of the current trading session. */
@@ -232,7 +271,7 @@ export interface Position {
   currentPrice: number;
   unrealizedPnL: number;
   realizedPnL: number;
-  /** Round-trip statutory cost estimate, already deducted from P&L. */
+  /** Round-trip statutory cost estimate for this leg. */
   charges: IndianCharges;
   openedAt: string;
 }
