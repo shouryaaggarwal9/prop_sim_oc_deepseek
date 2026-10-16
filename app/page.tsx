@@ -1,103 +1,215 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
-import { Navbar } from '@/components/Navbar';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Navbar, type AppTab } from '@/components/Navbar';
 import { PropFirmDashboard } from '@/components/PropFirmDashboard';
 import { StrategyBuilder } from '@/components/StrategyBuilder';
 import { BacktesterView } from '@/components/BacktesterView';
 import { MarketReplayView } from '@/components/MarketReplayView';
 import { TaxCalculatorView } from '@/components/TaxCalculatorModal';
 import { AccountModal } from '@/components/AccountModal';
-import { PropAccount, Position } from '@/lib/types';
-import { createPropAccount, evaluatePropRisk, rollOverTradingDay } from '@/lib/engine/propRisk';
+import { usePersistentState } from '@/lib/hooks/usePersistentState';
+import { useSyntheticSpot } from '@/lib/hooks/useSyntheticMarket';
+import type { Position, PropAccount, UnderlyingSymbol } from '@/lib/types';
+import { getInstrument } from '@/lib/types';
+import { premiumForStrike } from '@/lib/engine/pricing';
+import {
+  bookRealizedPnl,
+  createPropAccount,
+  evaluatePropRisk,
+  requestPayout,
+  rollOverTradingDay,
+  syncTradingDate,
+  withdrawableProfit,
+} from '@/lib/engine/propRisk';
+
+interface AppState {
+  account: PropAccount;
+  positions: Position[];
+}
+
+/** Days assumed for marking legs opened in the Prop Terminal. */
+const MARKING_DAYS_TO_EXPIRY = 3;
+
+/** Module-level so the identity is stable across renders (required by useSyncExternalStore). */
+const initialState: AppState = {
+  account: createPropAccount('Quant Trader', 'pro-10l', false),
+  positions: [],
+};
+
+/**
+ * Mark an open leg against the synthetic spot clock.
+ *
+ * Marking happens while rendering rather than being stored, so the position
+ * table, the equity headline and the risk engine can never disagree about
+ * what a position is worth.
+ */
+function markPosition(position: Position, spot: number): Position {
+  const ltp = premiumForStrike(
+    position.underlying,
+    position.type,
+    position.strike,
+    spot,
+    MARKING_DAYS_TO_EXPIRY
+  );
+  const points =
+    position.action === 'BUY' ? ltp - position.entryPrice : position.entryPrice - ltp;
+
+  return {
+    ...position,
+    currentPrice: Math.round(ltp * 100) / 100,
+    unrealizedPnL: Math.round(points * position.qty),
+  };
+}
+
+/**
+ * Apply the prop risk rules to a candidate state.
+ *
+ * This runs inside every state transition rather than in an effect, so equity
+ * can never be observed stale by the UI and a breach liquidates in the same
+ * commit that causes it.
+ */
+function applyRiskGuard(next: AppState, marks: Map<string, number>): AppState {
+  // Only a failed account is terminal. A passed funded account keeps trading
+  // and must stay under live breach monitoring.
+  if (next.account.status === 'FAILED') return next;
+
+  const unrealized = next.positions.reduce(
+    (acc, p) => acc + (marks.get(p.id) ?? p.unrealizedPnL),
+    0
+  );
+  const result = evaluatePropRisk(next.account, unrealized);
+  if (result.updatedAccount === next.account) return next;
+
+  return {
+    account: result.updatedAccount,
+    // A hard breach squares off every open position.
+    positions: result.hasBreached ? [] : next.positions,
+  };
+}
 
 export default function Home() {
-  const [activeTab, setActiveTab] = useState<'PROP' | 'STRATEGY' | 'BACKTEST' | 'REPLAY' | 'TAXES'>('PROP');
-  const [isAccountModalOpen, setIsAccountModalOpen] = useState<boolean>(false);
+  const [activeTab, setActiveTab] = useState<AppTab>('PROP');
+  const [isAccountModalOpen, setIsAccountModalOpen] = useState(false);
+  const [state, setState] = usePersistentState<AppState>('quantprop:state:v1', initialState);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [markingUnderlying, setMarkingUnderlying] = useState<UnderlyingSymbol>('NIFTY');
 
-  // Initialize account with ₹10 Lakhs Pro Challenge
-  const [account, setAccount] = useState<PropAccount>(() => {
-    return createPropAccount('Quant Trader', 'pro-10l', false);
-  });
+  const { account, positions: storedPositions } = state;
 
-  const [positions, setPositions] = useState<Position[]>([]);
+  const spot = useSyntheticSpot(markingUnderlying);
 
-  // Periodically evaluate open positions & risk
+  const positions = useMemo(
+    () => storedPositions.map((p) => markPosition(p, spot)),
+    [storedPositions, spot]
+  );
+
+  const marks = useMemo(
+    () => new Map(positions.map((p) => [p.id, p.unrealizedPnL] as const)),
+    [positions]
+  );
+
+  const commit = useCallback(
+    (mutate: (prev: AppState) => AppState) => {
+      setState((prev) => applyRiskGuard(mutate(prev), marks));
+    },
+    [setState, marks]
+  );
+
+  /** Roll the calendar day forward if the app was left open overnight. */
   useEffect(() => {
-    const unrealized = positions.reduce((acc, p) => acc + p.unrealizedPnL, 0);
-    const riskCheck = evaluatePropRisk(account, unrealized);
+    const tick = () => commit((prev) => ({ ...prev, account: syncTradingDate(prev.account) }));
+    tick();
+    const timer = window.setInterval(tick, 60_000);
+    return () => window.clearInterval(timer);
+  }, [commit]);
 
-    if (riskCheck.hasBreached && account.status !== 'FAILED') {
-      // Auto-liquidation
-      setPositions([]);
-      setAccount(riskCheck.updatedAccount);
-    } else if (riskCheck.hasPassedPhase && account.status !== 'PASSED') {
-      setAccount(riskCheck.updatedAccount);
-    }
-  }, [positions]);
+  const handleDeployStrategy = useCallback(
+    (newPositions: Position[]) => {
+      const first = newPositions[0];
+      // Mark the deployed structure against the clock for its own underlying.
+      if (first) setMarkingUnderlying(first.underlying);
+      commit((prev) => ({ ...prev, positions: [...prev.positions, ...newPositions] }));
+      setActiveTab('PROP');
+    },
+    [commit]
+  );
 
-  // Handle Strategy Deployment into Prop Account
-  const handleDeployStrategy = (newPositions: Position[]) => {
-    setPositions((prev) => [...prev, ...newPositions]);
-    // Switch to Prop Terminal to see the deployed trades
-    setActiveTab('PROP');
-  };
+  const handleSquareOffPosition = useCallback(
+    (positionId: string) => {
+      commit((prev) => {
+        const target = prev.positions.find((p) => p.id === positionId);
+        if (!target) return prev;
+        const pnl = marks.get(positionId) ?? target.unrealizedPnL;
+        return {
+          account: bookRealizedPnl(prev.account, pnl),
+          positions: prev.positions.filter((p) => p.id !== positionId),
+        };
+      });
+    },
+    [commit, marks]
+  );
 
-  // Square off single position
-  const handleSquareOffPosition = (positionId: string) => {
-    const pos = positions.find((p) => p.id === positionId);
-    if (!pos) return;
-
-    const realized = pos.unrealizedPnL;
-    const newPositions = positions.filter((p) => p.id !== positionId);
-    setPositions(newPositions);
-
-    setAccount((prev) => {
-      const newBal = prev.currentBalance + realized;
-      return {
-        ...prev,
-        currentBalance: newBal,
-        currentEquity: newBal + newPositions.reduce((acc, p) => acc + p.unrealizedPnL, 0),
-        highWaterMark: Math.max(prev.highWaterMark, newBal),
-      };
+  const handleSquareOffAll = useCallback(() => {
+    commit((prev) => {
+      const total = prev.positions.reduce(
+        (acc, p) => acc + (marks.get(p.id) ?? p.unrealizedPnL),
+        0
+      );
+      return { account: bookRealizedPnl(prev.account, total), positions: [] };
     });
-  };
+  }, [commit, marks]);
 
-  // Square off all positions
-  const handleSquareOffAll = () => {
-    const totalUnrealized = positions.reduce((acc, p) => acc + p.unrealizedPnL, 0);
-    setPositions([]);
-    setAccount((prev) => {
-      const newBal = prev.currentBalance + totalUnrealized;
-      return {
-        ...prev,
-        currentBalance: newBal,
-        currentEquity: newBal,
-        highWaterMark: Math.max(prev.highWaterMark, newBal),
-      };
-    });
-  };
-
-  // Reset Account after breach or retake
-  const handleResetAccount = () => {
-    setPositions([]);
-    setAccount(createPropAccount(account.traderName, account.ruleConfig.id, account.phase === 'FUNDED'));
-  };
-
-  // Payout request
-  const handleRequestPayout = (payoutAmount: number) => {
-    setAccount((prev) => ({
-      ...prev,
-      currentBalance: prev.currentBalance - payoutAmount,
-      currentEquity: prev.currentEquity - payoutAmount,
+  const handleResetAccount = useCallback(() => {
+    setState((prev) => ({
+      account: createPropAccount(
+        prev.account.traderName,
+        prev.account.ruleConfig.id,
+        prev.account.phase === 'FUNDED'
+      ),
+      positions: [],
     }));
-  };
+    setNotice(null);
+  }, [setState]);
 
-  // Switch or create new account
-  const handleSelectPreset = (traderName: string, presetId: string, instantFunded: boolean) => {
-    setPositions([]);
-    setAccount(createPropAccount(traderName, presetId, instantFunded));
-  };
+  /** Close the trading day: book P&L, count the day, reset the daily anchor. */
+  const handleEndTradingDay = useCallback(() => {
+    commit((prev) => ({ ...prev, account: rollOverTradingDay(prev.account, 0) }));
+    setNotice('Trading day closed. Daily loss limit reset and day counter advanced.');
+  }, [commit]);
+
+  const handleRequestPayout = useCallback(
+    (amount: number) => {
+      const result = requestPayout(account, amount);
+      if (result.error) {
+        setNotice(result.error);
+        return;
+      }
+      commit(() => ({ account: result.updatedAccount, positions: [] }));
+      setNotice('Simulated payout credited to your wallet.');
+    },
+    [account, commit]
+  );
+
+  const handleSelectPreset = useCallback(
+    (traderName: string, presetId: string, instantFunded: boolean) => {
+      setState({
+        account: createPropAccount(traderName, presetId, instantFunded),
+        positions: [],
+      });
+      setNotice(null);
+    },
+    [setState]
+  );
+
+  const handleReplayAccountUpdate = useCallback(
+    (updater: (prev: PropAccount) => PropAccount) => {
+      commit((prev) => ({ ...prev, account: updater(prev.account) }));
+    },
+    [commit]
+  );
+
+  const withdrawable = useMemo(() => withdrawableProfit(account), [account]);
 
   return (
     <div className="min-h-screen flex flex-col bg-[#0b0f19]">
@@ -109,13 +221,34 @@ export default function Home() {
       />
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 py-6">
+        {notice ? (
+          <div
+            role="status"
+            aria-live="polite"
+            className="mb-4 flex items-center justify-between gap-4 rounded-xl border border-cyan-500/40 bg-cyan-950/40 px-4 py-2.5 text-xs text-cyan-200"
+          >
+            <span>{notice}</span>
+            <button
+              type="button"
+              onClick={() => setNotice(null)}
+              className="font-semibold text-cyan-300 hover:text-white"
+            >
+              Dismiss
+            </button>
+          </div>
+        ) : null}
+
         {activeTab === 'PROP' && (
           <PropFirmDashboard
             account={account}
             positions={positions}
+            withdrawable={withdrawable}
+            spot={spot}
+            spotUnderlying={getInstrument(markingUnderlying).label}
             onSquareOffPosition={handleSquareOffPosition}
             onSquareOffAll={handleSquareOffAll}
             onResetAccount={handleResetAccount}
+            onEndTradingDay={handleEndTradingDay}
             onRequestPayout={handleRequestPayout}
           />
         )}
@@ -124,24 +257,20 @@ export default function Home() {
           <StrategyBuilder onDeployStrategy={handleDeployStrategy} />
         )}
 
-        {activeTab === 'BACKTEST' && (
-          <BacktesterView />
-        )}
+        {activeTab === 'BACKTEST' && <BacktesterView />}
 
         {activeTab === 'REPLAY' && (
           <MarketReplayView
             propAccount={account}
-            onUpdatePropAccount={setAccount}
+            onUpdateAccount={handleReplayAccountUpdate}
           />
         )}
 
-        {activeTab === 'TAXES' && (
-          <TaxCalculatorView />
-        )}
+        {activeTab === 'TAXES' && <TaxCalculatorView />}
       </main>
 
       <footer className="border-t border-slate-800/80 py-4 text-center text-xs text-slate-500">
-        QuantProp India • Open-Source Indian Derivatives & Prop Firm Simulator • Zero Paid APIs Required
+        QuantProp India • Open-Source Indian Derivatives &amp; Prop Firm Simulator • Simulated trading only
       </footer>
 
       <AccountModal

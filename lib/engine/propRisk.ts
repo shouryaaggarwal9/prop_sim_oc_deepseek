@@ -1,4 +1,10 @@
-import { PropAccount, ChallengeRuleConfig, ChallengePhase, AccountStatus, Position } from '../types';
+import {
+  type ChallengePhase,
+  type ChallengeRuleConfig,
+  type PropAccount,
+  type PayoutRecord,
+  TRADING_DAYS_PER_YEAR,
+} from '../types';
 
 export const DEFAULT_CHALLENGE_PRESETS: ChallengeRuleConfig[] = [
   {
@@ -28,7 +34,7 @@ export const DEFAULT_CHALLENGE_PRESETS: ChallengeRuleConfig[] = [
   {
     id: 'elite-25l',
     name: 'Elite Evaluation (₹25 Lakhs)',
-    accountSize: 2500000,
+    accountSize: 2505000,
     phase1TargetPct: 8,
     phase2TargetPct: 5,
     dailyLossPct: 5,
@@ -48,25 +54,40 @@ export const DEFAULT_CHALLENGE_PRESETS: ChallengeRuleConfig[] = [
     minTradingDays: 1,
     maxSingleDayProfitPct: 30,
     profitSplitPct: 80,
-  }
+  },
 ];
 
-/**
- * Creates a new Prop Account
- */
+export function getPreset(presetId: string): ChallengeRuleConfig {
+  return (
+    DEFAULT_CHALLENGE_PRESETS.find((p) => p.id === presetId) ??
+    DEFAULT_CHALLENGE_PRESETS[1]!
+  );
+}
+
+/** ISO calendar date (YYYY-MM-DD) for the current day. */
+export function todayIso(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function makeId(prefix: string): string {
+  const random =
+    typeof globalThis.crypto?.randomUUID === 'function'
+      ? globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 10)
+      : Math.random().toString(36).slice(2, 12);
+  return `${prefix}-${random.toUpperCase()}`;
+}
+
 export function createPropAccount(
   traderName: string,
-  presetId: string = 'pro-10l',
-  instantFunded: boolean = false
+  presetId = 'pro-10l',
+  instantFunded = false
 ): PropAccount {
-  const preset = DEFAULT_CHALLENGE_PRESETS.find((p) => p.id === presetId) || DEFAULT_CHALLENGE_PRESETS[1];
+  const preset = getPreset(presetId);
   const initial = preset.accountSize;
-  const maxLossFloor = initial * (1 - preset.maxTrailingLossPct / 100);
-  const dailyLossFloor = initial * (1 - preset.dailyLossPct / 100);
 
   return {
-    id: 'ACC-' + Math.random().toString(36).substring(2, 9).toUpperCase(),
-    traderName: traderName || 'Trader One',
+    id: makeId('ACC'),
+    traderName: traderName.trim() || 'Trader One',
     ruleConfig: preset,
     phase: instantFunded ? 'FUNDED' : 'PHASE_1',
     status: 'ACTIVE',
@@ -75,11 +96,28 @@ export function createPropAccount(
     currentEquity: initial,
     highWaterMark: initial,
     startingDayEquity: initial,
-    dailyLossFloor,
-    maxLossFloor,
+    dailyLossFloor: initial * (1 - preset.dailyLossPct / 100),
+    maxLossFloor: initial * (1 - preset.maxTrailingLossPct / 100),
     tradingDays: 0,
     dailyPnLHistory: [],
+    payouts: [],
     createdAt: new Date().toISOString(),
+    currentTradingDate: todayIso(),
+  };
+}
+
+/**
+ * Book realised P&L into the account balance. This is the only way equity
+ * should change hands-on, keeping the balance the single source of truth that
+ * `evaluatePropRisk` reads from.
+ */
+export function bookRealizedPnl(account: PropAccount, realizedPnl: number): PropAccount {
+  const nextBalance = account.currentBalance + realizedPnl;
+  return {
+    ...account,
+    currentBalance: nextBalance,
+    currentEquity: nextBalance,
+    highWaterMark: Math.max(account.highWaterMark, nextBalance),
   };
 }
 
@@ -92,32 +130,75 @@ export interface RiskEvaluationResult {
 }
 
 /**
- * Real-time Prop Risk Monitor & Liquidation Guardian
- * Checks Daily Drawdown, Trailing High-Water Mark Drawdown, and Target Achievements
+ * Profit needed to satisfy the current phase target.
+ * Funded accounts have no target and return 0.
+ */
+export function targetForPhase(account: PropAccount): number {
+  if (account.phase === 'PHASE_1') {
+    return account.initialBalance * (account.ruleConfig.phase1TargetPct / 100);
+  }
+  if (account.phase === 'PHASE_2') {
+    return account.initialBalance * (account.ruleConfig.phase2TargetPct / 100);
+  }
+  return 0;
+}
+
+/**
+ * Consistency rule: no single day's realised profit may exceed this share of
+ * the phase target. Evaluated against the *closed* day history, so the day in
+ * progress is deliberately excluded.
+ */
+export function violatesConsistencyRule(account: PropAccount): boolean {
+  const target = targetForPhase(account);
+  if (target <= 0) return false;
+  const allowance = target * (account.ruleConfig.maxSingleDayProfitPct / 100);
+  return account.dailyPnLHistory.some((d) => d.pnl > allowance);
+}
+
+/**
+ * Real-time prop risk monitor and liquidation guardian.
+ *
+ * Re-evaluates equity against the daily loss floor and the trailing
+ * high-water-mark floor, then checks phase progression. Call this on every
+ * mark-to-market tick and at end of day.
+ *
+ * Realised P&L must already be reflected in `account.currentBalance`; this
+ * function derives equity from the balance and open P&L alone, so there is a
+ * single source of truth for account value and no risk of double counting.
+ *
+ * @param unrealizedPnL Mark-to-market P&L of open positions, already net of charges.
  */
 export function evaluatePropRisk(
   account: PropAccount,
-  unrealizedPnL: number,
-  todayRealizedPnL: number = 0
+  unrealizedPnL: number
 ): RiskEvaluationResult {
-  if (account.status !== 'ACTIVE') {
-    return { updatedAccount: account, hasBreached: account.status === 'FAILED', hasPassedPhase: false };
+  // A failed account is terminal; nothing further is evaluated.
+  if (account.status === 'FAILED') {
+    return { updatedAccount: account, hasBreached: true, hasPassedPhase: false };
   }
+
+  // A PASSED funded account is still trading simulated capital, so it keeps its
+  // live equity and breach monitoring; it simply has no phase left to progress.
+  const canProgress = account.status === 'ACTIVE';
 
   const currentEquity = account.currentBalance + unrealizedPnL;
-  let highWaterMark = Math.max(account.highWaterMark, currentEquity);
+  const highWaterMark = Math.max(account.highWaterMark, currentEquity);
 
-  // Update Trailing High-Water Mark floor:
-  // Standard Prop rule: As equity climbs, the floor trails up. Once floor reaches initial balance, it locks at initial balance.
-  const trailingDistance = account.ruleConfig.accountSize * (account.ruleConfig.maxTrailingLossPct / 100);
-  let maxLossFloor = Math.max(account.maxLossFloor, highWaterMark - trailingDistance);
-  if (maxLossFloor > account.initialBalance) {
-    maxLossFloor = account.initialBalance; // lock at break-even floor once in profit
-  }
+  // Trailing floor: the high-water mark less the configured distance, which
+  // locks at the opening balance once the account is in profit so that a
+  // profitable account can never be pushed back below break-even.
+  const trailingDistance =
+    account.ruleConfig.accountSize * (account.ruleConfig.maxTrailingLossPct / 100);
+  const maxLossFloor = Math.min(
+    account.initialBalance,
+    Math.max(account.maxLossFloor, highWaterMark - trailingDistance)
+  );
 
-  // Daily Loss calculation: evaluated against startingDayEquity
+  // Daily loss floor is anchored to the day's opening equity and therefore
+  // resets on every rollover.
   const dayPnl = currentEquity - account.startingDayEquity;
-  const maxAllowedDailyLoss = account.startingDayEquity * (account.ruleConfig.dailyLossPct / 100);
+  const maxAllowedDailyLoss =
+    account.startingDayEquity * (account.ruleConfig.dailyLossPct / 100);
   const dailyLossFloor = account.startingDayEquity - maxAllowedDailyLoss;
 
   const updatedAccount: PropAccount = {
@@ -126,12 +207,16 @@ export function evaluatePropRisk(
     highWaterMark,
     maxLossFloor,
     dailyLossFloor,
+    lastTradeDate: todayIso(),
   };
 
-  // 1. Check Daily Loss Breach (Hard Breach)
+  // 1. Daily loss breach.
   if (currentEquity <= dailyLossFloor) {
     updatedAccount.status = 'FAILED';
-    updatedAccount.breachReason = `Daily Loss Limit Breached: Equity dropped by ₹${Math.abs(dayPnl).toLocaleString('en-IN')}, exceeding max allowed daily loss of ₹${maxAllowedDailyLoss.toLocaleString('en-IN')} (5%).`;
+    updatedAccount.breachReason =
+      `Daily loss limit breached: equity fell to ${fmt(currentEquity)}, which is at or below the ` +
+      `${account.ruleConfig.dailyLossPct}% daily floor of ${fmt(dailyLossFloor)} ` +
+      `(day P&L ${fmt(dayPnl)}, allowance ${fmt(maxAllowedDailyLoss)}).`;
     return {
       updatedAccount,
       hasBreached: true,
@@ -140,10 +225,13 @@ export function evaluatePropRisk(
     };
   }
 
-  // 2. Check Trailing Maximum Drawdown Breach (Hard Breach)
+  // 2. Trailing maximum drawdown breach.
   if (currentEquity <= maxLossFloor) {
     updatedAccount.status = 'FAILED';
-    updatedAccount.breachReason = `Maximum Trailing Drawdown Breached: Equity dropped below high-water mark floor of ₹${maxLossFloor.toLocaleString('en-IN')}.`;
+    updatedAccount.breachReason =
+      `Maximum trailing drawdown breached: equity ${fmt(currentEquity)} fell to or below the ` +
+      `high-water-mark floor of ${fmt(maxLossFloor)} (HWM ${fmt(highWaterMark)} less ` +
+      `${account.ruleConfig.maxTrailingLossPct}% trailing distance of ${fmt(trailingDistance)}).`;
     return {
       updatedAccount,
       hasBreached: true,
@@ -152,36 +240,32 @@ export function evaluatePropRisk(
     };
   }
 
-  // 3. Check Profit Target (Only for evaluation phases)
-  if (account.phase === 'PHASE_1' || account.phase === 'PHASE_2') {
-    const targetPct = account.phase === 'PHASE_1' ? account.ruleConfig.phase1TargetPct : account.ruleConfig.phase2TargetPct;
-    const targetAmount = account.ruleConfig.accountSize * (targetPct / 100);
+  // 3. Profit target and phase progression.
+  const targetAmount = targetForPhase(account);
+  if (canProgress && targetAmount > 0) {
     const totalProfit = currentEquity - account.initialBalance;
 
-    if (totalProfit >= targetAmount && account.tradingDays >= account.ruleConfig.minTradingDays) {
-      // Check consistency rule
-      const maxSingleDayAllowed = targetAmount * (account.ruleConfig.maxSingleDayProfitPct / 100);
-      const isConsistent = !account.dailyPnLHistory.some((d) => d.pnl > maxSingleDayAllowed);
+    if (totalProfit >= targetAmount) {
+      const daysSatisfied = account.tradingDays >= account.ruleConfig.minTradingDays;
+      const consistent = !violatesConsistencyRule(account);
 
-      if (isConsistent) {
+      if (daysSatisfied && consistent) {
         if (account.phase === 'PHASE_1') {
-          updatedAccount.phase = 'PHASE_2';
-          updatedAccount.currentBalance = account.initialBalance; // reset balance to full size for phase 2
-          updatedAccount.currentEquity = account.initialBalance;
-          updatedAccount.highWaterMark = account.initialBalance;
-          updatedAccount.startingDayEquity = account.initialBalance;
           return {
-            updatedAccount,
+            updatedAccount: advancePhase(updatedAccount, 'PHASE_2'),
             hasBreached: false,
             hasPassedPhase: true,
             nextPhase: 'PHASE_2',
           };
-        } else if (account.phase === 'PHASE_2') {
-          updatedAccount.phase = 'FUNDED';
-          updatedAccount.status = 'PASSED';
-          updatedAccount.passCertificateId = 'CERT-' + Math.random().toString(36).substring(2, 10).toUpperCase();
+        }
+        if (account.phase === 'PHASE_2') {
+          const passed: PropAccount = {
+            ...advancePhase(updatedAccount, 'FUNDED'),
+            status: 'PASSED',
+            passCertificateId: makeId('CERT'),
+          };
           return {
-            updatedAccount,
+            updatedAccount: passed,
             hasBreached: false,
             hasPassedPhase: true,
             nextPhase: 'FUNDED',
@@ -191,35 +275,158 @@ export function evaluatePropRisk(
     }
   }
 
+  return { updatedAccount, hasBreached: false, hasPassedPhase: false };
+}
+
+/**
+ * Move to the next phase. A fresh phase restarts with a clean balance, a clean
+ * day counter and a clean consistency history, mirroring how real two-phase
+ * evaluations are structured.
+ */
+function advancePhase(account: PropAccount, next: ChallengePhase): PropAccount {
   return {
-    updatedAccount,
-    hasBreached: false,
-    hasPassedPhase: false,
+    ...account,
+    phase: next,
+    currentBalance: account.initialBalance,
+    currentEquity: account.initialBalance,
+    highWaterMark: account.initialBalance,
+    startingDayEquity: account.initialBalance,
+    dailyLossFloor: account.initialBalance * (1 - account.ruleConfig.dailyLossPct / 100),
+    maxLossFloor:
+      account.initialBalance * (1 - account.ruleConfig.maxTrailingLossPct / 100),
+    tradingDays: 0,
+    dailyPnLHistory: [],
+    payouts: [],
+    currentTradingDate: todayIso(),
   };
 }
 
 /**
- * End of Day reconciliation
+ * Close the trading day: book realised P&L into balance, append the day to the
+ * consistency history, reset the daily anchor and advance the day counter.
+ *
+ * Only days that were actually traded are counted toward `minTradingDays`.
  */
-export function rollOverTradingDay(account: PropAccount, dayRealizedPnl: number): PropAccount {
-  const newBalance = account.currentBalance + dayRealizedPnl;
-  const newDays = account.tradingDays + 1;
-  const newHistory = [
-    ...account.dailyPnLHistory,
-    {
-      date: new Date().toLocaleDateString('en-IN'),
-      pnl: dayRealizedPnl,
-      isPassed: dayRealizedPnl >= 0,
-    },
-  ];
+export function rollOverTradingDay(
+  account: PropAccount,
+  dayRealizedPnL: number,
+  tradingDate?: string
+): PropAccount {
+  if (account.status !== 'ACTIVE') return account;
+
+  const date = tradingDate ?? todayIso();
+  const newBalance = account.currentBalance + dayRealizedPnL;
+
+  // A calendar date that has already been rolled over is a no-op, so repeated
+  // end-of-day ticks cannot double-count a day.
+  const alreadyRolled = account.dailyPnLHistory.some((d) => d.date === date);
+  const history = alreadyRolled
+    ? account.dailyPnLHistory.map((d) => (d.date === date ? { ...d, pnl: dayRealizedPnL } : d))
+    : [...account.dailyPnLHistory, { date, pnl: dayRealizedPnL }];
 
   return {
     ...account,
     currentBalance: newBalance,
     currentEquity: newBalance,
     startingDayEquity: newBalance,
-    tradingDays: newDays,
     dailyLossFloor: newBalance * (1 - account.ruleConfig.dailyLossPct / 100),
-    dailyPnLHistory: newHistory,
+    // maxLossFloor is owned by evaluatePropRisk and intentionally left untouched.
+    tradingDays: alreadyRolled ? account.tradingDays : account.tradingDays + 1,
+    dailyPnLHistory: history,
+    currentTradingDate: date,
+    lastTradeDate: date,
   };
+}
+
+/**
+ * Roll the calendar day forward if the session has crossed midnight, without
+ * closing the trading day. Guards against a tab left open overnight silently
+ * measuring the daily loss limit against yesterday's opening equity.
+ */
+export function syncTradingDate(account: PropAccount): PropAccount {
+  const today = todayIso();
+  if (account.currentTradingDate === today) return account;
+
+  return {
+    ...account,
+    currentTradingDate: today,
+    startingDayEquity: account.currentEquity,
+    dailyLossFloor: account.currentEquity * (1 - account.ruleConfig.dailyLossPct / 100),
+  };
+}
+
+/**
+ * Withdraw the trader's profit share from a funded account.
+ * Rejects non-positive amounts, over-withdrawals and withdrawals that would
+ * breach the trailing floor.
+ *
+ * A passed funded account is still allowed to withdraw: reaching FUNDED sets
+ * `status` to PASSED, so gating on ACTIVE here would permanently block the
+ * payout desk. Only a failed or non-funded account is refused.
+ */
+export function requestPayout(
+  account: PropAccount,
+  amount: number
+): { updatedAccount: PropAccount; error?: string } {
+  if (account.phase !== 'FUNDED' || account.status === 'FAILED') {
+    return {
+      updatedAccount: account,
+      error: 'Payouts are only available on an active funded account.',
+    };
+  }
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return { updatedAccount: account, error: 'Payout amount must be a positive number.' };
+  }
+
+  const available = Math.max(0, account.currentBalance - account.initialBalance);
+  if (amount > available) {
+    return {
+      updatedAccount: account,
+      error: `Requested ${fmt(amount)} but only ${fmt(available)} of profit is available.`,
+    };
+  }
+
+  const newBalance = account.currentBalance - amount;
+  if (newBalance <= account.maxLossFloor) {
+    return {
+      updatedAccount: account,
+      error: `Withdrawal would breach the trailing drawdown floor of ${fmt(account.maxLossFloor)}.`,
+    };
+  }
+
+  const record: PayoutRecord = {
+    id: makeId('PAY'),
+    date: todayIso(),
+    amount,
+    splitPct: account.ruleConfig.profitSplitPct,
+  };
+
+  return {
+    updatedAccount: {
+      ...account,
+      currentBalance: newBalance,
+      currentEquity: newBalance,
+      // Re-anchor the daily loss limit to the post-withdrawal balance. A
+      // withdrawal of one's own profit is an account event, not a trading
+      // loss, so it must not immediately consume the day's daily allowance.
+      startingDayEquity: newBalance,
+      dailyLossFloor: newBalance * (1 - account.ruleConfig.dailyLossPct / 100),
+      currentTradingDate: todayIso(),
+      payouts: [...account.payouts, record],
+    },
+  };
+}
+
+/** Profit currently eligible for withdrawal. */
+export function withdrawableProfit(account: PropAccount): number {
+  return Math.max(0, account.currentBalance - account.initialBalance);
+}
+
+function fmt(value: number): string {
+  return `₹${Math.round(value).toLocaleString('en-IN')}`;
+}
+
+/** Exposed for tests: converts a day count to a Black-Scholes year fraction. */
+export function daysToYearFraction(days: number): number {
+  return days / TRADING_DAYS_PER_YEAR;
 }
